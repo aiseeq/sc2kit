@@ -7,6 +7,7 @@ settings:
     - bin/*
     - testdata/*
     - "*.md"
+    - "*.pb.go"  # сгенерировано protoc из proto/ (make generate)
   min_severity: low
   output: console
 
