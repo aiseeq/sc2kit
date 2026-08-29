@@ -115,6 +115,22 @@ func (c *Client) Debug(ctx context.Context, commands ...*api.DebugCommand) error
 	return nil
 }
 
+// SaveReplay returns the replay of the current/finished game as bytes.
+func (c *Client) SaveReplay(ctx context.Context) ([]byte, error) {
+	resp, err := c.Request(ctx, &api.Request{Request: &api.Request_SaveReplay{SaveReplay: &api.RequestSaveReplay{}}})
+	if err != nil {
+		return nil, fmt.Errorf("save replay: %w", err)
+	}
+	sr := resp.GetSaveReplay()
+	if sr == nil {
+		return nil, fmt.Errorf("save replay: response is not a save-replay response: %v", resp)
+	}
+	if len(sr.GetData()) == 0 {
+		return nil, fmt.Errorf("save replay: empty replay data")
+	}
+	return sr.GetData(), nil
+}
+
 // LeaveGame surrenders/leaves the current game.
 func (c *Client) LeaveGame(ctx context.Context) error {
 	_, err := c.Request(ctx, &api.Request{Request: &api.Request_LeaveGame{LeaveGame: &api.RequestLeaveGame{}}})
