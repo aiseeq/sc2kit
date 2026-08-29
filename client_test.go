@@ -48,6 +48,16 @@ func fakeSC2(t *testing.T) (addr string, closeFn func()) {
 					}},
 					Status: api.Status_launched.Enum(),
 				}
+			} else if sr := req.GetStartReplay(); sr != nil {
+				r := &api.ResponseStartReplay{}
+				if len(sr.GetReplayData()) == 0 || len(sr.GetMapData()) == 0 {
+					r.Error = api.ResponseStartReplay_InvalidReplayData.Enum()
+					r.ErrorDetails = proto.String("empty replay or map data")
+				}
+				resp = &api.Response{
+					Response: &api.Response_StartReplay{StartReplay: r},
+					Status:   api.Status_in_replay.Enum(),
+				}
 			} else {
 				resp = &api.Response{Error: []string{"unsupported request"}}
 			}
@@ -107,6 +117,37 @@ func TestResponseErrors(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "unsupported request") {
 		t.Errorf("Request error = %v, want protocol error mentioning 'unsupported request'", err)
+	}
+}
+
+func TestStartReplay(t *testing.T) {
+	addr, closeFn := fakeSC2(t)
+	defer closeFn()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	c, err := Dial(ctx, addr)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer c.Close()
+
+	ok := &api.RequestStartReplay{
+		Replay:  &api.RequestStartReplay_ReplayData{ReplayData: []byte("replay")},
+		MapData: []byte("map"),
+	}
+	if err := c.StartReplay(ctx, ok); err != nil {
+		t.Fatalf("StartReplay: %v", err)
+	}
+
+	bad := &api.RequestStartReplay{Replay: &api.RequestStartReplay_ReplayData{}}
+	err = c.StartReplay(ctx, bad)
+	if err == nil {
+		t.Fatal("StartReplay с пустыми данными должен вернуть ошибку")
+	}
+	if !strings.Contains(err.Error(), "InvalidReplayData") {
+		t.Fatalf("ошибка должна содержать код InvalidReplayData, got: %v", err)
 	}
 }
 

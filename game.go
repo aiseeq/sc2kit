@@ -40,6 +40,26 @@ func (c *Client) JoinGame(ctx context.Context, req *api.RequestJoinGame) (uint32
 	return jg.GetPlayerId(), nil
 }
 
+// StartReplay starts playback of a replay on the connected SC2 client.
+// The replay only advances on Step requests: in the 4.10 client realtime=true
+// does not move a replay. Replays reference the map by the path of the
+// environment that recorded them, so set MapData to the map file contents to
+// play a replay anywhere.
+func (c *Client) StartReplay(ctx context.Context, req *api.RequestStartReplay) error {
+	resp, err := c.Request(ctx, &api.Request{Request: &api.Request_StartReplay{StartReplay: req}})
+	if err != nil {
+		return fmt.Errorf("start replay: %w", err)
+	}
+	sr := resp.GetStartReplay()
+	if sr == nil {
+		return fmt.Errorf("start replay: response is not a start-replay response: %v", resp)
+	}
+	if sr.Error != nil {
+		return fmt.Errorf("start replay: %v: %v", sr.GetError(), sr.GetErrorDetails())
+	}
+	return nil
+}
+
 // Observation requests the current game state.
 func (c *Client) Observation(ctx context.Context, req *api.RequestObservation) (*api.ResponseObservation, error) {
 	resp, err := c.Request(ctx, &api.Request{Request: &api.Request_Observation{Observation: req}})

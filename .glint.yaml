@@ -14,7 +14,13 @@ settings:
 categories:
   architecture: {enabled: true}
   duplication: {enabled: true}
-  patterns: {enabled: true}
+  patterns:
+    enabled: true
+    rules:
+      non-canonical-logger:
+        exceptions:
+          - files: "examples/**"
+            reason: "Примеры для пользователей либы: идиоматичный минимальный вывод (log.Fatalf/fmt.Printf) без навязывания логгера"
   typesafety: {enabled: true}
   security: {enabled: true}
   deadcode: {enabled: true}

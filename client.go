@@ -34,7 +34,12 @@ const dialRetryInterval = 500 * time.Millisecond
 // deadline.
 func Dial(ctx context.Context, addr string) (*Client, error) {
 	url := "ws://" + addr + "/sc2api"
-	dialer := websocket.Dialer{HandshakeTimeout: 5 * time.Second}
+	// WriteBufferSize должен вмещать самое большое сообщение целиком: при
+	// переполнении буфера gorilla фрагментирует сообщение на continuation-
+	// фреймы, а websocket-сервер SC2 фрагментацию не поддерживает и рвёт
+	// соединение (close 1006; поймано 2026-08-29 на StartReplay с map_data
+	// ~5 МБ). 32 МБ покрывают replay_data+map_data самых больших реплеев.
+	dialer := websocket.Dialer{HandshakeTimeout: 5 * time.Second, WriteBufferSize: 32 << 20}
 	var lastErr error
 	for {
 		conn, resp, err := dialer.DialContext(ctx, url, nil)
