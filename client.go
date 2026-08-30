@@ -103,7 +103,7 @@ func (c *Client) Request(ctx context.Context, req *api.Request) (*api.Response, 
 	}
 	c.status = resp.GetStatus()
 	if len(resp.GetError()) > 0 {
-		return resp, fmt.Errorf("sc2kit: response errors: %v", resp.GetError())
+		return resp, newProtocolError(resp.GetError(), resp.GetStatus())
 	}
 	return resp, nil
 }
