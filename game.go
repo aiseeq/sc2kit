@@ -126,6 +126,21 @@ func (c *Client) Data(ctx context.Context, req *api.RequestData) (*api.ResponseD
 	return d, nil
 }
 
+// Query asks the engine about placement, pathing and abilities: it answers the
+// same checks the engine itself does, so a spot accepted here will not be
+// silently dropped later.
+func (c *Client) Query(ctx context.Context, req *api.RequestQuery) (*api.ResponseQuery, error) {
+	resp, err := c.Request(ctx, &api.Request{Request: &api.Request_Query{Query: req}})
+	if err != nil {
+		return nil, fmt.Errorf("query: %w", err)
+	}
+	q := resp.GetQuery()
+	if q == nil {
+		return nil, fmt.Errorf("query: response is not a query response: %v", resp)
+	}
+	return q, nil
+}
+
 // Debug sends debug commands (create/kill units, set resources, ...).
 func (c *Client) Debug(ctx context.Context, commands ...*api.DebugCommand) error {
 	_, err := c.Request(ctx, &api.Request{Request: &api.Request_Debug{Debug: &api.RequestDebug{Debug: commands}}})
