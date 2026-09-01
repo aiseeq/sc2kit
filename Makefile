@@ -14,4 +14,4 @@ vet: ## go vet
 glint: ## Glint-анализ
 	@$(GLINT_BIN) check .
 
-smoke: vet test ## Быстрая проверка перед коммитом
+smoke: vet test glint ## Быстрая проверка перед коммитом
