@@ -2,6 +2,7 @@ package sc2kit
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -58,6 +59,10 @@ func fakeSC2(t *testing.T) (addr string, closeFn func()) {
 					Response: &api.Response_StartReplay{StartReplay: r},
 					Status:   api.Status_in_replay.Enum(),
 				}
+			} else if req.GetLeaveGame() != nil {
+				resp = &api.Response{Error: []string{"Not supported if game has already ended"}, Status: api.Status_ended.Enum()}
+			} else if req.GetQuit() != nil {
+				return // SC2 drops the socket on Quit without answering
 			} else {
 				resp = &api.Response{Error: []string{"unsupported request"}}
 			}
@@ -113,10 +118,47 @@ func TestResponseErrors(t *testing.T) {
 	defer c.Close()
 
 	_, err = c.Request(ctx, &api.Request{
-		Request: &api.Request_Quit{Quit: &api.RequestQuit{}},
+		Request: &api.Request_Debug{Debug: &api.RequestDebug{}},
 	})
 	if err == nil || !strings.Contains(err.Error(), "unsupported request") {
 		t.Errorf("Request error = %v, want protocol error mentioning 'unsupported request'", err)
+	}
+	// Both texts SC2 uses for "game over" unwrap to ErrGameEnded.
+	err = c.LeaveGame(ctx)
+	if !errors.Is(err, ErrGameEnded) {
+		t.Errorf("LeaveGame after end = %v, want ErrGameEnded", err)
+	}
+	var pe *ProtocolError
+	if !errors.As(err, &pe) || pe.Status != api.Status_ended {
+		t.Errorf("LeaveGame error = %v, want ProtocolError with status ended", err)
+	}
+}
+
+// A request whose answer never arrived leaves the stream out of step: every
+// later request must fail with ErrConnectionClosed instead of reading a stale
+// response; after status ended the failure reads as ErrGameEnded.
+func TestBrokenConnectionStaysBroken(t *testing.T) {
+	addr, closeFn := fakeSC2(t)
+	defer closeFn()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	c, err := Dial(ctx, addr)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer c.Close()
+
+	if err := c.LeaveGame(ctx); !errors.Is(err, ErrGameEnded) { // moves status to ended
+		t.Fatalf("LeaveGame: %v", err)
+	}
+	err = c.Quit(ctx) // server drops the socket without an answer
+	if !errors.Is(err, ErrGameEnded) {
+		t.Fatalf("Quit after ended = %v, want ErrGameEnded", err)
+	}
+	if _, err := c.Ping(ctx); !errors.Is(err, ErrConnectionClosed) {
+		t.Fatalf("Ping after broken socket = %v, want ErrConnectionClosed", err)
 	}
 }
 

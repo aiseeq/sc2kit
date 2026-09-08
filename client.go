@@ -22,6 +22,7 @@ type Client struct {
 	mu     sync.Mutex
 	conn   *websocket.Conn
 	status api.Status
+	broken error // first transport failure; every later request fails with ErrConnectionClosed
 }
 
 // dialRetryInterval is how often Dial retries while the SC2 process is still
@@ -38,7 +39,12 @@ func Dial(ctx context.Context, addr string) (*Client, error) {
 	// переполнении буфера gorilla фрагментирует сообщение на continuation-
 	// фреймы, а websocket-сервер SC2 фрагментацию не поддерживает и рвёт
 	// соединение (close 1006; поймано 2026-08-29 на StartReplay с map_data
-	// ~5 МБ). 32 МБ покрывают replay_data+map_data самых больших реплеев.
+	// ~5 МБ; тот же факт — go-sc2ai client/connection.go MaxMessageSize).
+	// 32 МБ покрывают replay_data+map_data самых больших реплеев.
+	// Ping-фреймы websocket не шлём (gorilla сам их не шлёт): сервер SC2
+	// не отвечает PONG, а разбирает ping как запрос и отдаёт пустой ответ
+	// (Tyr SC2API-CSharp/ProtobufProxy.cs, Sharky FastProtobufProxy.cs —
+	// оба ставят KeepAliveInterval в 30 дней).
 	dialer := websocket.Dialer{HandshakeTimeout: 5 * time.Second, WriteBufferSize: 32 << 20}
 	var lastErr error
 	for {
@@ -82,11 +88,15 @@ func (c *Client) Request(ctx context.Context, req *api.Request) (*api.Response, 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if c.broken != nil {
+		return nil, fmt.Errorf("%w (after: %v)", ErrConnectionClosed, c.broken)
+	}
 	deadline, _ := ctx.Deadline() // zero time = no deadline, accepted by Set*Deadline
 	if err := c.conn.SetWriteDeadline(deadline); err != nil {
 		return nil, fmt.Errorf("sc2kit: set write deadline: %w", err)
 	}
 	if err := c.conn.WriteMessage(websocket.BinaryMessage, data); err != nil {
+		c.broken = err
 		return nil, fmt.Errorf("sc2kit: send request: %w", err)
 	}
 	if err := c.conn.SetReadDeadline(deadline); err != nil {
@@ -94,6 +104,14 @@ func (c *Client) Request(ctx context.Context, req *api.Request) (*api.Response, 
 	}
 	_, raw, err := c.conn.ReadMessage()
 	if err != nil {
+		// The answer to this request is still in flight (or the socket is
+		// gone): the stream is out of step from here on.
+		c.broken = err
+		if c.status == api.Status_ended {
+			// python-sc2 protocol.py: a dead socket after status ended is the
+			// game being over, not a transport fault.
+			return nil, fmt.Errorf("sc2kit: read response: %w: %w", ErrGameEnded, err)
+		}
 		return nil, fmt.Errorf("sc2kit: read response: %w", err)
 	}
 
