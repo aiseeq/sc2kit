@@ -27,7 +27,7 @@ type Client struct {
 
 // dialRetryInterval is how often Dial retries while the SC2 process is still
 // starting up and not yet listening.
-const dialRetryInterval = 500 * time.Millisecond
+var dialRetryInterval = 500 * time.Millisecond
 
 // Dial connects to an SC2 client at addr (host:port), retrying until the
 // client accepts the connection or ctx is done. The game process needs a few
@@ -89,7 +89,7 @@ func (c *Client) Request(ctx context.Context, req *api.Request) (*api.Response, 
 	defer c.mu.Unlock()
 
 	if c.broken != nil {
-		return nil, fmt.Errorf("%w (after: %v)", ErrConnectionClosed, c.broken)
+		return nil, fmt.Errorf("%w (after: %w)", ErrConnectionClosed, c.broken)
 	}
 	deadline, _ := ctx.Deadline() // zero time = no deadline, accepted by Set*Deadline
 	if err := c.conn.SetWriteDeadline(deadline); err != nil {

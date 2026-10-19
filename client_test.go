@@ -194,7 +194,13 @@ func TestStartReplay(t *testing.T) {
 }
 
 func TestDialRetryUntilDeadline(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
+	const retryInterval = 20 * time.Millisecond
+	const timeout = 120 * time.Millisecond
+	oldRetryInterval := dialRetryInterval
+	dialRetryInterval = retryInterval
+	t.Cleanup(func() { dialRetryInterval = oldRetryInterval })
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	start := time.Now()
@@ -202,7 +208,10 @@ func TestDialRetryUntilDeadline(t *testing.T) {
 	if err == nil {
 		t.Fatal("Dial to a dead port succeeded")
 	}
-	if elapsed := time.Since(start); elapsed < time.Second {
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Dial error = %v, want context deadline", err)
+	}
+	if elapsed := time.Since(start); elapsed < timeout-retryInterval {
 		t.Errorf("Dial gave up after %v, want it to retry until ctx deadline", elapsed)
 	}
 }
