@@ -3,3 +3,4 @@ bin/
 *.out
 go.work
 go.work.sum
+/sc2kit
