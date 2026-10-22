@@ -45,7 +45,7 @@ func fakeSC2(t *testing.T) (addr string, closeFn func()) {
 			if req.GetPing() != nil {
 				resp = &api.Response{
 					Response: &api.Response_Ping{Ping: &api.ResponsePing{
-						GameVersion: proto.String("5.0.14.12345"),
+						GameVersion: new("5.0.14.12345"),
 					}},
 					Status: api.Status_launched.Enum(),
 				}
@@ -53,7 +53,7 @@ func fakeSC2(t *testing.T) (addr string, closeFn func()) {
 				r := &api.ResponseStartReplay{}
 				if len(sr.GetReplayData()) == 0 || len(sr.GetMapData()) == 0 {
 					r.Error = api.ResponseStartReplay_InvalidReplayData.Enum()
-					r.ErrorDetails = proto.String("empty replay or map data")
+					r.ErrorDetails = new("empty replay or map data")
 				}
 				resp = &api.Response{
 					Response: &api.Response_StartReplay{StartReplay: r},
