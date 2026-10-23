@@ -9,6 +9,7 @@ settings:
     - "*.md"
     - "*.pb.go"  # сгенерировано protoc из proto/ (make generate)
   min_severity: low
+  fail_on: low  # гейт — по коду выхода glint, падает на любой находке
   output: console
 
 categories:
