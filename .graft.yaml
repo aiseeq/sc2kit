@@ -12,11 +12,11 @@ tasks:
     run:
       - go test -p {threads} -json {args} ./...
 
-# Гейт: go vet (graft сам, первым шагом), gofmt, тесты и glint без находок.
+# Гейт: go vet (graft сам, первым шагом), gofmt, тесты и glint (см. порог ниже).
 gate:
   - sh: 'test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }'
   - task: test
-  # glint падает кодом выхода на любой находке: fail_on: low в .glint.yaml.
+  # glint падает кодом выхода на находке high и выше (fail_on по умолчанию).
   - sh: GOWORK=off ~/bin/glint check .
 
 version:
