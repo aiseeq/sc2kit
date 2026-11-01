@@ -11,13 +11,21 @@ tasks:
     tests: go
     run:
       - go test -p {threads} -json {args} ./...
+  glint:
+    desc: static analysis
+    heavy: true
+    # Busy machine: the gate sends glint to the remote_heavy host (pc) when the
+    # glint here is the copy install recorded there (hosts.json).
+    remote: true
+    env: {GOWORK: "off"}
+    run: [glint check .]
 
 # Гейт: go vet (graft сам, первым шагом), gofmt, тесты и glint (см. порог ниже).
 gate:
   - sh: 'test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }'
   - task: test
   # glint падает кодом выхода на находке high и выше (fail_on по умолчанию).
-  - sh: GOWORK=off ~/bin/glint check .
+  - task: glint
 
 version:
   mode: git-tag
