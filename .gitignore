@@ -4,4 +4,4 @@ bin/
 go.work
 go.work.sum
 /sc2kit
-/docs/tasks/
+/docs/tasks
