@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -247,6 +248,75 @@ func TestBrokenConnectionKeepsCause(t *testing.T) {
 	}
 }
 
+func TestEndedReadError(t *testing.T) {
+	endedResponse := func(req *api.Request) answer {
+		if req.GetPing() != nil {
+			return answer{resp: &api.Response{
+				Response: &api.Response_Ping{Ping: &api.ResponsePing{}},
+				Status:   api.Status_ended.Enum(),
+			}}
+		}
+		return answer{}
+	}
+	c, ctx := dialSC2(t, serveSC2(t, endedResponse))
+
+	if _, err := c.Ping(ctx); err != nil {
+		t.Fatalf("Ping: %v", err)
+	}
+	short, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	_, err := c.SaveReplay(short)
+	if !isTimeout(err) || !hasTransportTimeout(err) {
+		t.Errorf("SaveReplay error = %v, want timeout and its transport cause", err)
+	}
+	if errors.Is(err, ErrGameEnded) {
+		t.Errorf("SaveReplay error = %v, must not classify a read timeout as ErrGameEnded", err)
+	}
+
+	requestSeen := make(chan struct{})
+	c, ctx = dialSC2(t, serveSC2(t, func(req *api.Request) answer {
+		if req.GetPing() != nil {
+			return endedResponse(req)
+		}
+		close(requestSeen)
+		return answer{}
+	}))
+	if _, err := c.Ping(ctx); err != nil {
+		t.Fatalf("Ping before cancellation: %v", err)
+	}
+	cancelCtx, cancelRequest := context.WithCancel(ctx)
+	saveDone := make(chan error, 1)
+	go func() {
+		_, err := c.SaveReplay(cancelCtx)
+		saveDone <- err
+	}()
+	select {
+	case <-requestSeen:
+	case <-time.After(time.Second):
+		t.Fatal("server did not receive SaveReplay before cancellation")
+	}
+	cancelRequest()
+	err = <-saveDone
+	if !errors.Is(err, context.Canceled) || errors.Is(err, ErrGameEnded) || !hasTransportTimeout(err) {
+		t.Errorf("canceled SaveReplay error = %v, want cancellation and its transport cause, without ErrGameEnded", err)
+	}
+
+	c, ctx = dialSC2(t, serveSC2(t, func(req *api.Request) answer {
+		if req.GetPing() != nil {
+			return endedResponse(req)
+		}
+		return answer{drop: true}
+	}))
+	if _, err := c.Ping(ctx); err != nil {
+		t.Fatalf("Ping before connection drop: %v", err)
+	}
+	_, err = c.SaveReplay(ctx)
+	var closeErr *websocket.CloseError
+	if !errors.Is(err, ErrGameEnded) || !errors.As(err, &closeErr) {
+		t.Errorf("SaveReplay after connection drop = %v, want ErrGameEnded and original websocket close error", err)
+	}
+}
+
 func TestRequestCancel(t *testing.T) {
 	requests := make(chan struct{}, 3)
 	c, ctx := dialSC2(t, serveSC2(t, func(*api.Request) answer {
@@ -298,6 +368,20 @@ func TestRequestCancel(t *testing.T) {
 // the net package's timeout behind its own net.Error (hideTempErr), so
 // os.ErrDeadlineExceeded is not in the chain.
 func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
+func hasTransportTimeout(err error) bool {
+	if err == nil || err == context.DeadlineExceeded || err == context.Canceled {
+		return false
+	}
+	if multi, ok := err.(interface{ Unwrap() []error }); ok {
+		return slices.ContainsFunc(multi.Unwrap(), hasTransportTimeout)
+	}
+	if cause := errors.Unwrap(err); cause != nil {
+		return hasTransportTimeout(cause)
+	}
 	var ne net.Error
 	return errors.As(err, &ne) && ne.Timeout()
 }

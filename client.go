@@ -5,7 +5,10 @@ package sc2kit
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -125,11 +128,9 @@ func (c *Client) Request(ctx context.Context, req *api.Request) (*api.Response, 
 		// gone): the stream is out of step from here on.
 		c.broken = err
 		if ctx.Err() != nil {
-			return nil, fmt.Errorf("sc2kit: read response: %w", ctx.Err())
+			return nil, fmt.Errorf("sc2kit: read response: %w: %w", ctx.Err(), err)
 		}
-		if c.status == api.Status_ended {
-			// python-sc2 protocol.py: a dead socket after status ended is the
-			// game being over, not a transport fault.
+		if c.status == api.Status_ended && !isTimeoutError(err) {
 			return nil, fmt.Errorf("sc2kit: read response: %w: %w", ErrGameEnded, err)
 		}
 		return nil, fmt.Errorf("sc2kit: read response: %w", err)
@@ -144,6 +145,14 @@ func (c *Client) Request(ctx context.Context, req *api.Request) (*api.Response, 
 		return resp, newProtocolError(resp.GetError(), resp.GetStatus())
 	}
 	return resp, nil
+}
+
+func isTimeoutError(err error) bool {
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var networkError net.Error
+	return errors.As(err, &networkError) && networkError.Timeout()
 }
 
 func (c *Client) acquireRequest(ctx context.Context) (func(), error) {
