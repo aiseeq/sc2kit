@@ -2,7 +2,12 @@ package sc2kit
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"net"
+
+	"github.com/gorilla/websocket"
 
 	"github.com/aiseeq/sc2kit/api"
 )
@@ -149,11 +154,15 @@ func (c *Client) Query(ctx context.Context, req *api.RequestQuery) (*api.Respons
 	return q, nil
 }
 
-// Debug sends debug commands (create/kill units, set resources, ...).
+// Debug sends debug commands (create/kill units, set resources, ...) and
+// verifies that the server returned a debug response.
 func (c *Client) Debug(ctx context.Context, commands ...*api.DebugCommand) error {
-	_, err := c.Request(ctx, &api.Request{Request: &api.Request_Debug{Debug: &api.RequestDebug{Debug: commands}}})
+	resp, err := c.Request(ctx, &api.Request{Request: &api.Request_Debug{Debug: &api.RequestDebug{Debug: commands}}})
 	if err != nil {
 		return fmt.Errorf("debug: %w", err)
+	}
+	if resp.GetDebug() == nil {
+		return fmt.Errorf("debug: response is not a debug response: %v", resp)
 	}
 	return nil
 }
@@ -174,20 +183,39 @@ func (c *Client) SaveReplay(ctx context.Context) ([]byte, error) {
 	return sr.GetData(), nil
 }
 
-// LeaveGame surrenders/leaves the current game.
+// LeaveGame surrenders/leaves the current game and verifies that the server
+// returned a leave-game response.
 func (c *Client) LeaveGame(ctx context.Context) error {
-	_, err := c.Request(ctx, &api.Request{Request: &api.Request_LeaveGame{LeaveGame: &api.RequestLeaveGame{}}})
+	resp, err := c.Request(ctx, &api.Request{Request: &api.Request_LeaveGame{LeaveGame: &api.RequestLeaveGame{}}})
 	if err != nil {
 		return fmt.Errorf("leave game: %w", err)
+	}
+	if resp.GetLeaveGame() == nil {
+		return fmt.Errorf("leave game: response is not a leave-game response: %v", resp)
 	}
 	return nil
 }
 
-// Quit shuts the SC2 client process down.
+// Quit shuts the SC2 client process down. SC2 may close the websocket without
+// a response; when it sends one, it must be a quit response.
 func (c *Client) Quit(ctx context.Context) error {
-	_, err := c.Request(ctx, &api.Request{Request: &api.Request_Quit{Quit: &api.RequestQuit{}}})
+	resp, err := c.Request(ctx, &api.Request{Request: &api.Request_Quit{Quit: &api.RequestQuit{}}})
 	if err != nil {
+		if isQuitConnectionClose(err) {
+			return nil
+		}
 		return fmt.Errorf("quit: %w", err)
 	}
+	if resp.GetQuit() == nil {
+		return fmt.Errorf("quit: response is not a quit response: %v", resp)
+	}
 	return nil
+}
+
+func isQuitConnectionClose(err error) bool {
+	if errors.Is(err, ErrConnectionClosed) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var closeErr *websocket.CloseError
+	return errors.As(err, &closeErr) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed)
 }

@@ -210,6 +210,30 @@ func TestResponseWarning(t *testing.T) {
 	}
 }
 
+func TestCommandResponseKind(t *testing.T) {
+	c, ctx := dialSC2(t, serveSC2(t, func(*api.Request) answer {
+		return answer{resp: &api.Response{
+			Response: &api.Response_Ping{Ping: &api.ResponsePing{}},
+			Status:   api.Status_in_game.Enum(),
+		}}
+	}))
+
+	if err := c.Debug(ctx); err == nil {
+		t.Error("Debug accepted a ping response")
+	}
+	if err := c.LeaveGame(ctx); err == nil {
+		t.Error("LeaveGame accepted a ping response")
+	}
+	if err := c.Quit(ctx); err == nil {
+		t.Error("Quit accepted a ping response")
+	}
+
+	c, ctx = dialSC2(t, serveSC2(t, func(*api.Request) answer { return answer{drop: true} }))
+	if err := c.Quit(ctx); err != nil {
+		t.Errorf("Quit when server closes without a response = %v, want success", err)
+	}
+}
+
 // A request whose answer never arrived leaves the stream out of step: every
 // later request must fail with ErrConnectionClosed instead of reading a stale
 // response; after status ended the failure reads as ErrGameEnded.
@@ -220,8 +244,8 @@ func TestBrokenConnectionStaysBroken(t *testing.T) {
 		t.Fatalf("LeaveGame: %v", err)
 	}
 	err := c.Quit(ctx) // server drops the socket without an answer
-	if !errors.Is(err, ErrGameEnded) {
-		t.Fatalf("Quit after ended = %v, want ErrGameEnded", err)
+	if err != nil {
+		t.Fatalf("Quit after ended = %v, want success on the expected socket close", err)
 	}
 	if _, err := c.Ping(ctx); !errors.Is(err, ErrConnectionClosed) {
 		t.Fatalf("Ping after broken socket = %v, want ErrConnectionClosed", err)
