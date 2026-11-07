@@ -25,9 +25,11 @@ var ErrGameEnded = errors.New("sc2kit: game has already ended")
 // request channel on the websocket close handler.
 var ErrConnectionClosed = errors.New("sc2kit: connection closed")
 
-// ProtocolError carries the protocol-level errors an SC2 response contained.
-// Unwrap yields a sentinel (such as ErrGameEnded) for the conditions the
-// library recognises, so callers never match on message text themselves.
+// ProtocolError carries protocol errors from a response without a command
+// result, and recognized protocol conditions even when a command result is
+// present. Unrecognized messages accompanying a result are returned as
+// warnings. Unwrap yields a sentinel (such as ErrGameEnded) for known
+// conditions, so callers never match on message text themselves.
 type ProtocolError struct {
 	Errors []string   // Response.error, verbatim
 	Status api.Status // client status reported with the response
@@ -42,10 +44,13 @@ func (e *ProtocolError) Unwrap() error { return e.known }
 
 // newProtocolError builds a ProtocolError, recognising the known conditions.
 func newProtocolError(msgs []string, status api.Status) *ProtocolError {
-	e := &ProtocolError{Errors: msgs, Status: status}
+	return &ProtocolError{Errors: msgs, Status: status, known: knownProtocolError(msgs)}
+}
+
+func knownProtocolError(msgs []string) error {
 	joined := strings.ToLower(strings.Join(msgs, "; "))
 	if strings.Contains(joined, "game has already ended") || strings.Contains(joined, "not supported if game has already ended") {
-		e.known = ErrGameEnded
+		return ErrGameEnded
 	}
-	return e
+	return nil
 }

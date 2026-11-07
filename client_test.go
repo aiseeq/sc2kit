@@ -169,6 +169,47 @@ func TestResponseErrors(t *testing.T) {
 	}
 }
 
+func TestResponseWarning(t *testing.T) {
+	warning := "observation was truncated"
+	c, ctx := dialSC2(t, serveSC2(t, func(req *api.Request) answer {
+		if req.GetObservation() != nil {
+			messages := []string{warning}
+			if req.GetObservation().GetGameLoop() == 1 {
+				messages = []string{"Game has already ended"}
+			}
+			return answer{resp: &api.Response{
+				Response: &api.Response_Observation{Observation: &api.ResponseObservation{
+					Observation: &api.Observation{GameLoop: new(uint32(42))},
+				}},
+				Error:  messages,
+				Status: api.Status_in_game.Enum(),
+			}}
+		}
+		return answer{resp: &api.Response{Error: []string{"request rejected"}}}
+	}))
+
+	obs, warnings, err := c.ObservationWithWarnings(ctx, &api.RequestObservation{})
+	if err != nil {
+		t.Fatalf("ObservationWithWarnings: %v", err)
+	}
+	if got := obs.GetObservation().GetGameLoop(); got != 42 {
+		t.Errorf("observation game loop = %d, want 42", got)
+	}
+	if len(warnings) != 1 || warnings[0] != warning {
+		t.Errorf("warnings = %q, want [%q]", warnings, warning)
+	}
+	_, _, err = c.ObservationWithWarnings(ctx, &api.RequestObservation{GameLoop: new(uint32(1))})
+	if !errors.Is(err, ErrGameEnded) {
+		t.Errorf("observation with game-ended response error = %v, want ErrGameEnded", err)
+	}
+
+	_, err = c.Request(ctx, &api.Request{Request: &api.Request_Debug{Debug: &api.RequestDebug{}}})
+	var protocolErr *ProtocolError
+	if !errors.As(err, &protocolErr) {
+		t.Errorf("response without command error = %v, want ProtocolError", err)
+	}
+}
+
 // A request whose answer never arrived leaves the stream out of step: every
 // later request must fail with ErrConnectionClosed instead of reading a stale
 // response; after status ended the failure reads as ErrGameEnded.

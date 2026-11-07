@@ -81,9 +81,10 @@ func (c *Client) Status() api.Status {
 	return c.status
 }
 
-// Request sends one request and waits for its response. A Response carrying
-// protocol-level errors is returned together with a non-nil error — never
-// silently.
+// Request sends one request and waits for its response. Unrecognized errors
+// accompanying a command result are warnings returned in Response.error.
+// Recognized protocol conditions and errors without a command result are
+// returned as ProtocolError.
 func (c *Client) Request(ctx context.Context, req *api.Request) (*api.Response, error) {
 	data, err := proto.Marshal(req)
 	if err != nil {
@@ -142,7 +143,10 @@ func (c *Client) Request(ctx context.Context, req *api.Request) (*api.Response, 
 	}
 	c.status = resp.GetStatus()
 	if len(resp.GetError()) > 0 {
-		return resp, newProtocolError(resp.GetError(), resp.GetStatus())
+		protocolErr := newProtocolError(resp.GetError(), resp.GetStatus())
+		if resp.GetResponse() == nil || protocolErr.known != nil {
+			return resp, protocolErr
+		}
 	}
 	return resp, nil
 }

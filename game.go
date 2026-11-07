@@ -60,17 +60,25 @@ func (c *Client) StartReplay(ctx context.Context, req *api.RequestStartReplay) e
 	return nil
 }
 
-// Observation requests the current game state.
+// Observation requests the current game state. Use ObservationWithWarnings to
+// retrieve warnings returned alongside the observation.
 func (c *Client) Observation(ctx context.Context, req *api.RequestObservation) (*api.ResponseObservation, error) {
+	obs, _, err := c.ObservationWithWarnings(ctx, req)
+	return obs, err
+}
+
+// ObservationWithWarnings requests the current game state and returns any
+// warnings SC2 included alongside the observation.
+func (c *Client) ObservationWithWarnings(ctx context.Context, req *api.RequestObservation) (*api.ResponseObservation, []string, error) {
 	resp, err := c.Request(ctx, &api.Request{Request: &api.Request_Observation{Observation: req}})
 	if err != nil {
-		return nil, fmt.Errorf("observation: %w", err)
+		return nil, nil, fmt.Errorf("observation: %w", err)
 	}
 	obs := resp.GetObservation()
 	if obs == nil {
-		return nil, fmt.Errorf("observation: response is not an observation response: %v", resp)
+		return nil, nil, fmt.Errorf("observation: response is not an observation response: %v", resp)
 	}
-	return obs, nil
+	return obs, resp.GetError(), nil
 }
 
 // Step advances a non-realtime game by count game loops.
