@@ -34,18 +34,7 @@ type answer struct {
 // serveSC2 is a minimal in-process stand-in for the SC2 client: a websocket
 // server on /sc2api handing every request to handle. It returns host:port.
 func serveSC2(t *testing.T, handle func(*api.Request) answer) string {
-	t.Helper()
-	up := websocket.Upgrader{}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/sc2api" {
-			http.NotFound(w, r)
-			return
-		}
-		conn, err := up.Upgrade(w, r, nil)
-		if err != nil {
-			t.Errorf("upgrade: %v", err)
-			return
-		}
+	return serveSC2Connection(t, func(conn *websocket.Conn) {
 		defer conn.Close()
 		for {
 			_, data, err := conn.ReadMessage()
@@ -73,6 +62,23 @@ func serveSC2(t *testing.T, handle func(*api.Request) answer) string {
 				return
 			}
 		}
+	})
+}
+
+func serveSC2Connection(t *testing.T, handle func(*websocket.Conn)) string {
+	t.Helper()
+	up := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/sc2api" {
+			http.NotFound(w, r)
+			return
+		}
+		conn, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade: %v", err)
+			return
+		}
+		handle(conn)
 	}))
 	t.Cleanup(srv.Close)
 	return strings.TrimPrefix(srv.URL, "http://")
@@ -185,20 +191,48 @@ func TestResponseWarning(t *testing.T) {
 				Status: api.Status_in_game.Enum(),
 			}}
 		}
+		if req.GetAction() != nil {
+			return answer{resp: &api.Response{
+				Response: &api.Response_Action{Action: &api.ResponseAction{Result: []api.ActionResult{api.ActionResult_Success}}},
+				Error:    []string{"some actions were skipped"},
+			}}
+		}
 		return answer{resp: &api.Response{Error: []string{"request rejected"}}}
 	}))
+	type warningEvent struct {
+		kind     string
+		warnings []string
+	}
+	warnings := make(chan warningEvent, 2)
+	c.SetWarningHandler(func(req *api.Request, messages []string) {
+		warnings <- warningEvent{kind: fmt.Sprintf("%T", req.GetRequest()), warnings: messages}
+	})
 
-	obs, warnings, err := c.ObservationWithWarnings(ctx, &api.RequestObservation{})
+	obs, err := c.Observation(ctx, &api.RequestObservation{})
 	if err != nil {
-		t.Fatalf("ObservationWithWarnings: %v", err)
+		t.Fatalf("Observation: %v", err)
 	}
 	if got := obs.GetObservation().GetGameLoop(); got != 42 {
 		t.Errorf("observation game loop = %d, want 42", got)
 	}
-	if len(warnings) != 1 || warnings[0] != warning {
-		t.Errorf("warnings = %q, want [%q]", warnings, warning)
+	act, err := c.Action(ctx, nil)
+	if err != nil || len(act) != 1 || act[0] != api.ActionResult_Success {
+		t.Errorf("Action result = %v, %v; want [Success]", act, err)
 	}
-	_, _, err = c.ObservationWithWarnings(ctx, &api.RequestObservation{GameLoop: new(uint32(1))})
+	for _, want := range []warningEvent{
+		{kind: "*api.Request_Observation", warnings: []string{warning}},
+		{kind: "*api.Request_Action", warnings: []string{"some actions were skipped"}},
+	} {
+		select {
+		case got := <-warnings:
+			if got.kind != want.kind || !slices.Equal(got.warnings, want.warnings) {
+				t.Errorf("warning event = %+v, want %+v", got, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("warning handler did not receive %s warnings", want.kind)
+		}
+	}
+	_, err = c.Observation(ctx, &api.RequestObservation{GameLoop: new(uint32(1))})
 	if !errors.Is(err, ErrGameEnded) {
 		t.Errorf("observation with game-ended response error = %v, want ErrGameEnded", err)
 	}
@@ -227,6 +261,12 @@ func TestCommandResponseKind(t *testing.T) {
 	if err := c.Quit(ctx); err == nil {
 		t.Error("Quit accepted a ping response")
 	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close before Quit: %v", err)
+	}
+	if err := c.Quit(ctx); err == nil {
+		t.Error("Quit after Close succeeded without sending the request")
+	}
 
 	c, ctx = dialSC2(t, serveSC2(t, func(*api.Request) answer { return answer{drop: true} }))
 	if err := c.Quit(ctx); err != nil {
@@ -236,7 +276,7 @@ func TestCommandResponseKind(t *testing.T) {
 
 // A request whose answer never arrived leaves the stream out of step: every
 // later request must fail with ErrConnectionClosed instead of reading a stale
-// response; after status ended the failure reads as ErrGameEnded.
+// response; transport failures retain their original cause regardless of status.
 func TestBrokenConnectionStaysBroken(t *testing.T) {
 	c, ctx := dialSC2(t, fakeSC2(t))
 
@@ -320,7 +360,7 @@ func TestBrokenConnectionKeepsCause(t *testing.T) {
 
 	short, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
 	defer cancel()
-	if _, err := c.Observation(short, &api.RequestObservation{}); !isTimeout(err) {
+	if _, err := c.Observation(short, &api.RequestObservation{}); !isTimeout(err) || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Observation without an answer = %v, want read timeout", err)
 	}
 	_, err := c.Ping(ctx)
@@ -350,7 +390,7 @@ func TestEndedReadError(t *testing.T) {
 	short, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
 	defer cancel()
 	_, err := c.SaveReplay(short)
-	if !isTimeout(err) || !hasTransportTimeout(err) {
+	if !isTimeout(err) || !errors.Is(err, context.DeadlineExceeded) || !hasTransportTimeout(err) {
 		t.Errorf("SaveReplay error = %v, want timeout and its transport cause", err)
 	}
 	if errors.Is(err, ErrGameEnded) {
@@ -380,7 +420,7 @@ func TestEndedReadError(t *testing.T) {
 		t.Fatal("server did not receive SaveReplay before cancellation")
 	}
 	cancelRequest()
-	err = <-saveDone
+	err = waitRequestError(t, saveDone, "canceled SaveReplay")
 	if !errors.Is(err, context.Canceled) || errors.Is(err, ErrGameEnded) || !hasTransportTimeout(err) {
 		t.Errorf("canceled SaveReplay error = %v, want cancellation and its transport cause, without ErrGameEnded", err)
 	}
@@ -396,8 +436,8 @@ func TestEndedReadError(t *testing.T) {
 	}
 	_, err = c.SaveReplay(ctx)
 	var closeErr *websocket.CloseError
-	if !errors.Is(err, ErrGameEnded) || !errors.As(err, &closeErr) {
-		t.Errorf("SaveReplay after connection drop = %v, want ErrGameEnded and original websocket close error", err)
+	if errors.Is(err, ErrGameEnded) || !errors.As(err, &closeErr) {
+		t.Errorf("SaveReplay after connection drop = %v, want transport error without ErrGameEnded", err)
 	}
 }
 
@@ -426,12 +466,17 @@ func TestRequestCancel(t *testing.T) {
 		_, err := c.Request(secondCtx, &api.Request{Request: &api.Request_Ping{Ping: &api.RequestPing{}}})
 		secondDone <- err
 	}()
+	select {
+	case err := <-secondDone:
+		t.Fatalf("queued request returned before cancellation: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
 	cancelSecond()
-	if err := <-secondDone; !errors.Is(err, context.Canceled) {
+	if err := waitRequestError(t, secondDone, "queued request"); !errors.Is(err, context.Canceled) {
 		t.Errorf("queued request error = %v, want context.Canceled", err)
 	}
 	cancelFirst()
-	if err := <-firstDone; !errors.Is(err, context.Canceled) {
+	if err := waitRequestError(t, firstDone, "first request"); !errors.Is(err, context.Canceled) {
 		t.Errorf("first request error = %v, want context.Canceled", err)
 	}
 
@@ -445,6 +490,53 @@ func TestRequestCancel(t *testing.T) {
 	case <-requests:
 		t.Error("pre-canceled request was sent")
 	default:
+	}
+}
+
+func TestRequestCancelDuringWrite(t *testing.T) {
+	ready := make(chan struct{})
+	release := make(chan struct{})
+	defer close(release)
+	addr := serveSC2Connection(t, func(conn *websocket.Conn) {
+		close(ready)
+		<-release // deliberately do not read client frames
+		_ = conn.Close()
+	})
+	c, _ := dialSC2(t, addr)
+	select {
+	case <-ready:
+	case <-time.After(time.Second):
+		t.Fatal("server did not complete websocket handshake")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.Request(ctx, &api.Request{Request: &api.Request_StartReplay{StartReplay: &api.RequestStartReplay{
+			Replay: &api.RequestStartReplay_ReplayData{ReplayData: make([]byte, 30<<20)},
+		}}})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("large write completed before cancellation: %v", err)
+	case <-time.After(500 * time.Millisecond):
+	}
+	cancel()
+	err := waitRequestError(t, done, "write cancellation")
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("large request error = %v, want context.Canceled", err)
+	}
+}
+
+func waitRequestError(t *testing.T, done <-chan error, name string) error {
+	t.Helper()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for %s", name)
+		return nil
 	}
 }
 
@@ -598,19 +690,7 @@ type frameResult struct {
 
 func rawFrameSC2Server(t *testing.T, frames chan<- frameResult) string {
 	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, rw, err := http.NewResponseController(w).Hijack()
-		if err != nil {
-			t.Errorf("hijack: %v", err)
-			return
-		}
-		defer conn.Close()
-		sum := sha1.Sum([]byte(r.Header.Get("Sec-WebSocket-Key") + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
-		fmt.Fprintf(rw, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n",
-			base64.StdEncoding.EncodeToString(sum[:]))
-		if err := rw.Flush(); err != nil {
-			return
-		}
+	return rawWebSocketServer(t, func(rw *bufio.ReadWriter) {
 		f, err := readFrame(rw.Reader)
 		frames <- frameResult{frame: f, err: err}
 		if err != nil || !f.fin {
@@ -627,6 +707,25 @@ func rawFrameSC2Server(t *testing.T, frames chan<- frameResult) string {
 		_, _ = rw.Write(append([]byte{0x82, byte(len(out))}, out...)) // FIN + binary, unmasked
 		_ = rw.Flush()
 		_, _ = readFrame(rw.Reader) // until the client closes
+	})
+}
+
+func rawWebSocketServer(t *testing.T, connected func(*bufio.ReadWriter)) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, rw, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		defer conn.Close()
+		sum := sha1.Sum([]byte(r.Header.Get("Sec-WebSocket-Key") + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+		fmt.Fprintf(rw, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n",
+			base64.StdEncoding.EncodeToString(sum[:]))
+		if err := rw.Flush(); err != nil {
+			return
+		}
+		connected(rw)
 	}))
 	t.Cleanup(srv.Close)
 	return strings.TrimPrefix(srv.URL, "http://")

@@ -65,25 +65,18 @@ func (c *Client) StartReplay(ctx context.Context, req *api.RequestStartReplay) e
 	return nil
 }
 
-// Observation requests the current game state. Use ObservationWithWarnings to
-// retrieve warnings returned alongside the observation.
+// Observation requests the current game state. Warnings accompanying a valid
+// observation are delivered through the client's warning handler or slog.
 func (c *Client) Observation(ctx context.Context, req *api.RequestObservation) (*api.ResponseObservation, error) {
-	obs, _, err := c.ObservationWithWarnings(ctx, req)
-	return obs, err
-}
-
-// ObservationWithWarnings requests the current game state and returns any
-// warnings SC2 included alongside the observation.
-func (c *Client) ObservationWithWarnings(ctx context.Context, req *api.RequestObservation) (*api.ResponseObservation, []string, error) {
 	resp, err := c.Request(ctx, &api.Request{Request: &api.Request_Observation{Observation: req}})
 	if err != nil {
-		return nil, nil, fmt.Errorf("observation: %w", err)
+		return nil, fmt.Errorf("observation: %w", err)
 	}
 	obs := resp.GetObservation()
 	if obs == nil {
-		return nil, nil, fmt.Errorf("observation: response is not an observation response: %v", resp)
+		return nil, fmt.Errorf("observation: response is not an observation response: %v", resp)
 	}
-	return obs, resp.GetError(), nil
+	return obs, nil
 }
 
 // Step advances a non-realtime game by count game loops.
@@ -196,8 +189,9 @@ func (c *Client) LeaveGame(ctx context.Context) error {
 	return nil
 }
 
-// Quit shuts the SC2 client process down. SC2 may close the websocket without
-// a response; when it sends one, it must be a quit response.
+// Quit shuts the SC2 client process down. After the request is sent, SC2 may
+// close the websocket without a response; when it sends one, it must be a quit
+// response. Errors that prevent sending the request remain errors.
 func (c *Client) Quit(ctx context.Context) error {
 	resp, err := c.Request(ctx, &api.Request{Request: &api.Request_Quit{Quit: &api.RequestQuit{}}})
 	if err != nil {
@@ -214,6 +208,14 @@ func (c *Client) Quit(ctx context.Context) error {
 
 func isQuitConnectionClose(err error) bool {
 	if errors.Is(err, ErrConnectionClosed) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var deadlineErr *requestDeadlineError
+	if errors.As(err, &deadlineErr) {
+		return false
+	}
+	var readErr *responseReadError
+	if !errors.As(err, &readErr) {
 		return false
 	}
 	var closeErr *websocket.CloseError

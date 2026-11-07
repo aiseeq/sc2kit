@@ -5,11 +5,10 @@ package sc2kit
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/url"
-	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -25,11 +24,13 @@ import (
 // client processes one request at a time. Context cancellation interrupts
 // queue waiting and network I/O.
 type Client struct {
-	mu     sync.Mutex
-	queue  chan struct{}
-	conn   *websocket.Conn
-	status api.Status
-	broken error // first transport failure; every later request fails with ErrConnectionClosed
+	mu             sync.Mutex
+	queue          chan struct{}
+	conn           *websocket.Conn
+	status         api.Status
+	broken         error // first transport failure; every later request fails with ErrConnectionClosed
+	warningMu      sync.RWMutex
+	warningHandler func(req *api.Request, warnings []string)
 }
 
 // dialRetryInterval is how often Dial retries while the SC2 process is still
@@ -100,6 +101,26 @@ func (c *Client) Close() error {
 	return c.conn.Close()
 }
 
+// SetWarningHandler sets the callback for warnings returned alongside command
+// results. The callback receives the request and a copy of warning texts. If
+// handler is nil, warnings are written to the default slog logger.
+func (c *Client) SetWarningHandler(handler func(req *api.Request, warnings []string)) {
+	c.warningMu.Lock()
+	c.warningHandler = handler
+	c.warningMu.Unlock()
+}
+
+func (c *Client) reportWarnings(req *api.Request, warnings []string) {
+	c.warningMu.RLock()
+	handler := c.warningHandler
+	c.warningMu.RUnlock()
+	if handler != nil {
+		handler(req, append([]string(nil), warnings...))
+		return
+	}
+	slog.Warn("SC2 response warnings", "request", fmt.Sprintf("%T", req.GetRequest()), "warnings", warnings)
+}
+
 // Status returns the last game status reported by the SC2 client.
 func (c *Client) Status() api.Status {
 	c.mu.Lock()
@@ -107,13 +128,16 @@ func (c *Client) Status() api.Status {
 	return c.status
 }
 
-// Request sends one request and waits for its response. The marshaled request
-// must not exceed 32 MiB; larger requests are rejected before any bytes are
-// written so SC2 never receives a fragmented message. Unrecognized errors
-// accompanying a command result are warnings returned in Response.error.
+// Request sends one request and waits for its response. Context cancellation
+// interrupts queue waits and network I/O; a canceled or expired context remains
+// identifiable in the returned error. The marshaled request must not exceed
+// 32 MiB; larger requests are rejected before any bytes are written so SC2
+// never receives a fragmented message. Unrecognized errors accompanying a
+// command result are warnings retained in Response.error and delivered to the
+// configured warning handler, or logged with slog if none is configured.
 // Recognized protocol conditions and errors without a command result are
 // returned as ProtocolError.
-func (c *Client) Request(ctx context.Context, req *api.Request) (*api.Response, error) {
+func (c *Client) Request(ctx context.Context, req *api.Request) (response *api.Response, requestErr error) {
 	data, err := proto.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("sc2kit: marshal request: %w", err)
@@ -121,6 +145,12 @@ func (c *Client) Request(ctx context.Context, req *api.Request) (*api.Response, 
 	if len(data) > maxRequestSize {
 		return nil, fmt.Errorf("sc2kit: request size %d exceeds maximum request size %d bytes", len(data), maxRequestSize)
 	}
+	var warnings []string
+	defer func() {
+		if len(warnings) > 0 {
+			c.reportWarnings(req, warnings)
+		}
+	}()
 
 	release, err := c.acquireRequest(ctx)
 	if err != nil {
@@ -139,14 +169,23 @@ func (c *Client) Request(ctx context.Context, req *api.Request) (*api.Response, 
 		return nil, err
 	}
 	defer func() {
-		if err := stopCancel(); err != nil && c.broken == nil {
-			c.broken = err
+		if err := stopCancel(); err != nil {
+			if c.broken == nil {
+				c.broken = err
+			}
+			deadlineErr := &requestDeadlineError{err: err}
+			if requestErr == nil {
+				response = nil
+				requestErr = fmt.Errorf("sc2kit: reset request deadlines: %w", deadlineErr)
+			} else {
+				requestErr = fmt.Errorf("%w: %w", requestErr, deadlineErr)
+			}
 		}
 	}()
 	if err := c.conn.WriteMessage(websocket.BinaryMessage, data); err != nil {
 		c.broken = err
 		if ctx.Err() != nil {
-			return nil, fmt.Errorf("sc2kit: send request: %w", ctx.Err())
+			return nil, fmt.Errorf("sc2kit: send request: %w: %w", ctx.Err(), err)
 		}
 		return nil, fmt.Errorf("sc2kit: send request: %w", err)
 	}
@@ -159,13 +198,11 @@ func (c *Client) Request(ctx context.Context, req *api.Request) (*api.Response, 
 		// The answer to this request is still in flight (or the socket is
 		// gone): the stream is out of step from here on.
 		c.broken = err
+		readErr := &responseReadError{err: err}
 		if ctx.Err() != nil {
-			return nil, fmt.Errorf("sc2kit: read response: %w: %w", ctx.Err(), err)
+			return nil, fmt.Errorf("sc2kit: read response: %w: %w", ctx.Err(), readErr)
 		}
-		if c.status == api.Status_ended && !isTimeoutError(err) {
-			return nil, fmt.Errorf("sc2kit: read response: %w: %w", ErrGameEnded, err)
-		}
-		return nil, fmt.Errorf("sc2kit: read response: %w", err)
+		return nil, fmt.Errorf("sc2kit: read response: %w", readErr)
 	}
 
 	resp := &api.Response{}
@@ -178,19 +215,21 @@ func (c *Client) Request(ctx context.Context, req *api.Request) (*api.Response, 
 		if resp.GetResponse() == nil || protocolErr.known != nil {
 			return resp, protocolErr
 		}
+		warnings = resp.GetError()
 	}
 	return resp, nil
 }
 
-func isTimeoutError(err error) bool {
-	if errors.Is(err, os.ErrDeadlineExceeded) {
-		return true
-	}
-	var networkError net.Error
-	return errors.As(err, &networkError) && networkError.Timeout()
-}
-
 func (c *Client) acquireRequest(ctx context.Context) (func(), error) {
+	select {
+	case c.queue <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			<-c.queue
+			return nil, fmt.Errorf("sc2kit: request context: %w", err)
+		}
+		return func() { <-c.queue }, nil
+	default:
+	}
 	select {
 	case c.queue <- struct{}{}:
 		if err := ctx.Err(); err != nil {
@@ -204,20 +243,13 @@ func (c *Client) acquireRequest(ctx context.Context) (func(), error) {
 }
 
 func (c *Client) interruptRequestOnCancel(ctx context.Context) (func() error, error) {
-	deadline, _ := ctx.Deadline() // zero time = no deadline, accepted by Set*Deadline
-	if err := c.conn.SetReadDeadline(deadline); err != nil {
-		return nil, fmt.Errorf("sc2kit: set read deadline: %w", err)
-	}
-	if err := c.conn.SetWriteDeadline(deadline); err != nil {
-		return nil, fmt.Errorf("sc2kit: set write deadline: %w", err)
-	}
 	cancelDone := make(chan struct{})
 	cancelErrors := make(chan error, 2)
 	stop := context.AfterFunc(ctx, func() {
 		if err := c.conn.SetReadDeadline(time.Now()); err != nil {
 			cancelErrors <- err
 		}
-		if err := c.conn.SetWriteDeadline(time.Now()); err != nil {
+		if err := c.conn.UnderlyingConn().SetWriteDeadline(time.Now()); err != nil {
 			cancelErrors <- err
 		}
 		close(cancelDone)
@@ -230,7 +262,7 @@ func (c *Client) interruptRequestOnCancel(ctx context.Context) (func() error, er
 		if err := c.conn.SetReadDeadline(time.Time{}); err != nil {
 			firstErr = err
 		}
-		if err := c.conn.SetWriteDeadline(time.Time{}); err != nil && firstErr == nil {
+		if err := c.conn.UnderlyingConn().SetWriteDeadline(time.Time{}); err != nil && firstErr == nil {
 			firstErr = err
 		}
 		select {

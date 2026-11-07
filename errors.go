@@ -7,15 +7,10 @@ import (
 	"github.com/aiseeq/sc2kit/api"
 )
 
-// ErrGameEnded marks a protocol response saying the game or replay has ended,
-// and a socket closure while reading a response after the client reported
-// Status_ended. For a socket closure, the transport error is also preserved in
-// the error chain; read timeouts and context cancellation are not ErrGameEnded.
-// The protocol reports its refusal as free-form text in Response.error, so the
-// text is matched here, once, and callers use errors.Is. The two texts SC2 uses
-// are the ones python-sc2 recognises (sc2/protocol.py
-// ProtocolError.is_game_over_error): "Game has already ended" and "Not
-// supported if game has already ended".
+// ErrGameEnded marks a protocol response saying the game or replay has ended.
+// It is recognized from free-form Response.error text, so callers use errors.Is
+// instead of matching the message themselves. Transport failures, including
+// socket closure after Status_ended, do not produce ErrGameEnded.
 var ErrGameEnded = errors.New("sc2kit: game has already ended")
 
 // ErrConnectionClosed is returned by every request after the websocket
@@ -35,6 +30,18 @@ type ProtocolError struct {
 	Status api.Status // client status reported with the response
 	known  error
 }
+
+type responseReadError struct{ err error }
+
+func (e *responseReadError) Error() string { return e.err.Error() }
+
+func (e *responseReadError) Unwrap() error { return e.err }
+
+type requestDeadlineError struct{ err error }
+
+func (e *requestDeadlineError) Error() string { return e.err.Error() }
+
+func (e *requestDeadlineError) Unwrap() error { return e.err }
 
 func (e *ProtocolError) Error() string {
 	return "sc2kit: response errors: " + strings.Join(e.Errors, "; ")
