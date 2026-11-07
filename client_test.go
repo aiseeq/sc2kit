@@ -529,6 +529,41 @@ func TestRequestCancelDuringWrite(t *testing.T) {
 	}
 }
 
+func TestRequestCancelBeforeWrite(t *testing.T) {
+	big := &api.Request{Request: &api.Request_StartReplay{StartReplay: &api.RequestStartReplay{
+		Replay: &api.RequestStartReplay_ReplayData{ReplayData: make([]byte, 30<<20)},
+	}}}
+	release := make(chan struct{})
+	defer close(release)
+	addr := serveSC2Connection(t, func(conn *websocket.Conn) {
+		<-release // keep the peer from reading any request
+		_ = conn.Close()
+	})
+
+	for i := range 20 {
+		c, _ := dialSC2(t, addr)
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() {
+			_, err := c.Request(ctx, big)
+			done <- err
+		}()
+		time.Sleep(time.Duration(i) * time.Millisecond)
+		cancel()
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("request canceled after %dms = %v, want context.Canceled", i, err)
+			}
+		case <-time.After(time.Second):
+			_ = c.Close()
+			t.Fatalf("request canceled after %dms remained blocked", i)
+		}
+		cancel()
+		_ = c.Close()
+	}
+}
+
 func waitRequestError(t *testing.T, done <-chan error, name string) error {
 	t.Helper()
 	select {

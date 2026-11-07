@@ -22,11 +22,13 @@ import (
 // Client is a connection to a running SC2 client (websocket endpoint /sc2api).
 // It is safe for concurrent use: requests are serialized because the SC2
 // client processes one request at a time. Context cancellation interrupts
-// queue waiting and network I/O.
+// queue waiting and network I/O, including writes while a WebSocket frame is
+// being prepared.
 type Client struct {
 	mu             sync.Mutex
 	queue          chan struct{}
 	conn           *websocket.Conn
+	transport      *cancelableConn
 	status         api.Status
 	broken         error // first transport failure; every later request fails with ErrConnectionClosed
 	warningMu      sync.RWMutex
@@ -60,11 +62,20 @@ func Dial(ctx context.Context, addr string) (*Client, error) {
 	// (Tyr SC2API-CSharp/ProtobufProxy.cs, Sharky FastProtobufProxy.cs —
 	// оба ставят KeepAliveInterval в 30 дней).
 	dialer := websocket.Dialer{HandshakeTimeout: 5 * time.Second, WriteBufferSize: maxRequestSize}
+	var transport *cancelableConn
+	dialer.NetDialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := (&net.Dialer{}).DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		transport = &cancelableConn{Conn: conn}
+		return transport, nil
+	}
 	var lastErr error
 	for {
 		conn, resp, err := dialer.DialContext(ctx, url, nil)
 		if err == nil {
-			return &Client{conn: conn, queue: make(chan struct{}, 1)}, nil
+			return &Client{conn: conn, transport: transport, queue: make(chan struct{}, 1)}, nil
 		}
 		if resp != nil {
 			_ = resp.Body.Close()
@@ -76,6 +87,47 @@ func Dial(ctx context.Context, addr string) (*Client, error) {
 		case <-time.After(dialRetryInterval):
 		}
 	}
+}
+
+// cancelableConn keeps a canceled write interrupted even when gorilla resets
+// its per-frame write deadline while preparing a frame.
+type cancelableConn struct {
+	net.Conn
+	writeMu       sync.Mutex
+	writeCanceled bool
+}
+
+func (c *cancelableConn) SetWriteDeadline(deadline time.Time) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.writeCanceled {
+		deadline = time.Now()
+	}
+	return c.Conn.SetWriteDeadline(deadline)
+}
+
+func (c *cancelableConn) Write(p []byte) (int, error) {
+	c.writeMu.Lock()
+	canceled := c.writeCanceled
+	c.writeMu.Unlock()
+	if canceled {
+		return 0, context.Canceled
+	}
+	return c.Conn.Write(p)
+}
+
+func (c *cancelableConn) expireWriteDeadline() error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	c.writeCanceled = true
+	return c.Conn.SetWriteDeadline(time.Now())
+}
+
+func (c *cancelableConn) resetWriteDeadline() error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	c.writeCanceled = false
+	return c.Conn.SetWriteDeadline(time.Time{})
 }
 
 func validateDialAddress(addr string) error {
@@ -249,7 +301,7 @@ func (c *Client) interruptRequestOnCancel(ctx context.Context) (func() error, er
 		if err := c.conn.SetReadDeadline(time.Now()); err != nil {
 			cancelErrors <- err
 		}
-		if err := c.conn.UnderlyingConn().SetWriteDeadline(time.Now()); err != nil {
+		if err := c.transport.expireWriteDeadline(); err != nil {
 			cancelErrors <- err
 		}
 		close(cancelDone)
@@ -262,7 +314,7 @@ func (c *Client) interruptRequestOnCancel(ctx context.Context) (func() error, er
 		if err := c.conn.SetReadDeadline(time.Time{}); err != nil {
 			firstErr = err
 		}
-		if err := c.conn.UnderlyingConn().SetWriteDeadline(time.Time{}); err != nil && firstErr == nil {
+		if err := c.transport.resetWriteDeadline(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 		select {
