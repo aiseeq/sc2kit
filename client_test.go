@@ -247,6 +247,53 @@ func TestBrokenConnectionKeepsCause(t *testing.T) {
 	}
 }
 
+func TestRequestCancel(t *testing.T) {
+	requests := make(chan struct{}, 3)
+	c, ctx := dialSC2(t, serveSC2(t, func(*api.Request) answer {
+		requests <- struct{}{}
+		return answer{}
+	}))
+
+	firstCtx, cancelFirst := context.WithCancel(ctx)
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := c.Request(firstCtx, &api.Request{Request: &api.Request_Ping{Ping: &api.RequestPing{}}})
+		firstDone <- err
+	}()
+	select {
+	case <-requests:
+	case <-time.After(time.Second):
+		t.Fatal("server did not receive first request")
+	}
+
+	secondCtx, cancelSecond := context.WithCancel(ctx)
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := c.Request(secondCtx, &api.Request{Request: &api.Request_Ping{Ping: &api.RequestPing{}}})
+		secondDone <- err
+	}()
+	cancelSecond()
+	if err := <-secondDone; !errors.Is(err, context.Canceled) {
+		t.Errorf("queued request error = %v, want context.Canceled", err)
+	}
+	cancelFirst()
+	if err := <-firstDone; !errors.Is(err, context.Canceled) {
+		t.Errorf("first request error = %v, want context.Canceled", err)
+	}
+
+	preCanceled, cancel := context.WithCancel(ctx)
+	cancel()
+	_, err := c.Request(preCanceled, &api.Request{Request: &api.Request_Ping{Ping: &api.RequestPing{}}})
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("pre-canceled request error = %v, want context.Canceled", err)
+	}
+	select {
+	case <-requests:
+		t.Error("pre-canceled request was sent")
+	default:
+	}
+}
+
 // isTimeout reports a network timeout anywhere in err's chain. gorilla hides
 // the net package's timeout behind its own net.Error (hideTempErr), so
 // os.ErrDeadlineExceeded is not in the chain.

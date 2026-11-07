@@ -16,10 +16,12 @@ import (
 )
 
 // Client is a connection to a running SC2 client (websocket endpoint /sc2api).
-// It is safe for concurrent use: requests are serialized with a mutex because
-// the SC2 client processes one request at a time.
+// It is safe for concurrent use: requests are serialized because the SC2
+// client processes one request at a time. Context cancellation interrupts
+// queue waiting and network I/O.
 type Client struct {
 	mu     sync.Mutex
+	queue  chan struct{}
 	conn   *websocket.Conn
 	status api.Status
 	broken error // first transport failure; every later request fails with ErrConnectionClosed
@@ -50,7 +52,7 @@ func Dial(ctx context.Context, addr string) (*Client, error) {
 	for {
 		conn, resp, err := dialer.DialContext(ctx, url, nil)
 		if err == nil {
-			return &Client{conn: conn}, nil
+			return &Client{conn: conn, queue: make(chan struct{}, 1)}, nil
 		}
 		if resp != nil {
 			_ = resp.Body.Close()
@@ -85,28 +87,46 @@ func (c *Client) Request(ctx context.Context, req *api.Request) (*api.Response, 
 		return nil, fmt.Errorf("sc2kit: marshal request: %w", err)
 	}
 
+	release, err := c.acquireRequest(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if c.broken != nil {
 		return nil, fmt.Errorf("%w (after: %w)", ErrConnectionClosed, c.broken)
 	}
-	deadline, _ := ctx.Deadline() // zero time = no deadline, accepted by Set*Deadline
-	if err := c.conn.SetWriteDeadline(deadline); err != nil {
-		return nil, fmt.Errorf("sc2kit: set write deadline: %w", err)
+	stopCancel, err := c.interruptRequestOnCancel(ctx)
+	if err != nil {
+		return nil, err
 	}
+	defer func() {
+		if err := stopCancel(); err != nil && c.broken == nil {
+			c.broken = err
+		}
+	}()
 	if err := c.conn.WriteMessage(websocket.BinaryMessage, data); err != nil {
 		c.broken = err
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("sc2kit: send request: %w", ctx.Err())
+		}
 		return nil, fmt.Errorf("sc2kit: send request: %w", err)
 	}
-	if err := c.conn.SetReadDeadline(deadline); err != nil {
-		return nil, fmt.Errorf("sc2kit: set read deadline: %w", err)
+	if err := ctx.Err(); err != nil {
+		c.broken = err
+		return nil, fmt.Errorf("sc2kit: read response: %w", err)
 	}
 	_, raw, err := c.conn.ReadMessage()
 	if err != nil {
 		// The answer to this request is still in flight (or the socket is
 		// gone): the stream is out of step from here on.
 		c.broken = err
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("sc2kit: read response: %w", ctx.Err())
+		}
 		if c.status == api.Status_ended {
 			// python-sc2 protocol.py: a dead socket after status ended is the
 			// game being over, not a transport fault.
@@ -124,6 +144,67 @@ func (c *Client) Request(ctx context.Context, req *api.Request) (*api.Response, 
 		return resp, newProtocolError(resp.GetError(), resp.GetStatus())
 	}
 	return resp, nil
+}
+
+func (c *Client) acquireRequest(ctx context.Context) (func(), error) {
+	select {
+	case c.queue <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			<-c.queue
+			return nil, fmt.Errorf("sc2kit: request context: %w", err)
+		}
+		return func() { <-c.queue }, nil
+	case <-ctx.Done():
+		return nil, fmt.Errorf("sc2kit: wait for request queue: %w", ctx.Err())
+	}
+}
+
+func (c *Client) interruptRequestOnCancel(ctx context.Context) (func() error, error) {
+	deadline, _ := ctx.Deadline() // zero time = no deadline, accepted by Set*Deadline
+	if err := c.conn.SetReadDeadline(deadline); err != nil {
+		return nil, fmt.Errorf("sc2kit: set read deadline: %w", err)
+	}
+	if err := c.conn.SetWriteDeadline(deadline); err != nil {
+		return nil, fmt.Errorf("sc2kit: set write deadline: %w", err)
+	}
+	cancelDone := make(chan struct{})
+	cancelErrors := make(chan error, 2)
+	stop := context.AfterFunc(ctx, func() {
+		if err := c.conn.SetReadDeadline(time.Now()); err != nil {
+			cancelErrors <- err
+		}
+		if err := c.conn.SetWriteDeadline(time.Now()); err != nil {
+			cancelErrors <- err
+		}
+		close(cancelDone)
+	})
+	return func() error {
+		if !stop() {
+			<-cancelDone
+		}
+		var firstErr error
+		if err := c.conn.SetReadDeadline(time.Time{}); err != nil {
+			firstErr = err
+		}
+		if err := c.conn.SetWriteDeadline(time.Time{}); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		select {
+		case err := <-cancelErrors:
+			if firstErr == nil {
+				firstErr = err
+			}
+		default:
+		}
+		select {
+		case err := <-cancelErrors:
+			if firstErr == nil {
+				firstErr = err
+			}
+		default:
+		}
+		return firstErr
+	}, nil
 }
 
 // Ping asks the SC2 client for its build and version info.
