@@ -95,6 +95,7 @@ type cancelableConn struct {
 	net.Conn
 	writeMu       sync.Mutex
 	writeCanceled bool
+	writeErr      error
 }
 
 func (c *cancelableConn) SetWriteDeadline(deadline time.Time) error {
@@ -109,25 +110,26 @@ func (c *cancelableConn) SetWriteDeadline(deadline time.Time) error {
 func (c *cancelableConn) Write(p []byte) (int, error) {
 	c.writeMu.Lock()
 	canceled := c.writeCanceled
+	err := c.writeErr
 	c.writeMu.Unlock()
 	if canceled {
-		return 0, context.Canceled
+		if err == nil {
+			err = context.Canceled
+		}
+		return 0, err
 	}
 	return c.Conn.Write(p)
 }
 
-func (c *cancelableConn) expireWriteDeadline() error {
+func (c *cancelableConn) setWriteCancellation(canceled bool, err error, deadline time.Time) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	c.writeCanceled = true
-	return c.Conn.SetWriteDeadline(time.Now())
-}
-
-func (c *cancelableConn) resetWriteDeadline() error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	c.writeCanceled = false
-	return c.Conn.SetWriteDeadline(time.Time{})
+	c.writeCanceled = canceled
+	c.writeErr = err
+	if canceled {
+		deadline = time.Now()
+	}
+	return c.Conn.SetWriteDeadline(deadline)
 }
 
 func validateDialAddress(addr string) error {
@@ -182,11 +184,12 @@ func (c *Client) Status() api.Status {
 
 // Request sends one request and waits for its response. Context cancellation
 // interrupts queue waits and network I/O; a canceled or expired context remains
-// identifiable in the returned error. The marshaled request must not exceed
-// 32 MiB; larger requests are rejected before any bytes are written so SC2
-// never receives a fragmented message. Unrecognized errors accompanying a
-// command result are warnings retained in Response.error and delivered to the
-// configured warning handler, or logged with slog if none is configured.
+// identifiable as context.Canceled or context.DeadlineExceeded, respectively.
+// The marshaled request must not exceed 32 MiB; larger requests are rejected
+// before any bytes are written so SC2 never receives a fragmented message.
+// Unrecognized errors accompanying a command result are warnings retained in
+// Response.error and delivered to the configured warning handler, or logged
+// with slog if none is configured.
 // Recognized protocol conditions and errors without a command result are
 // returned as ProtocolError.
 func (c *Client) Request(ctx context.Context, req *api.Request) (response *api.Response, requestErr error) {
@@ -301,7 +304,7 @@ func (c *Client) interruptRequestOnCancel(ctx context.Context) (func() error, er
 		if err := c.conn.SetReadDeadline(time.Now()); err != nil {
 			cancelErrors <- err
 		}
-		if err := c.transport.expireWriteDeadline(); err != nil {
+		if err := c.transport.setWriteCancellation(true, ctx.Err(), time.Time{}); err != nil {
 			cancelErrors <- err
 		}
 		close(cancelDone)
@@ -314,7 +317,7 @@ func (c *Client) interruptRequestOnCancel(ctx context.Context) (func() error, er
 		if err := c.conn.SetReadDeadline(time.Time{}); err != nil {
 			firstErr = err
 		}
-		if err := c.transport.resetWriteDeadline(); err != nil && firstErr == nil {
+		if err := c.transport.setWriteCancellation(false, nil, time.Time{}); err != nil && firstErr == nil {
 			firstErr = err
 		}
 		select {
