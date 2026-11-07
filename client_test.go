@@ -270,6 +270,25 @@ func TestDialRetryUntilDeadline(t *testing.T) {
 	}
 }
 
+func TestDialPermanent(t *testing.T) {
+	for _, addr := range []string{"127.0.0.1:not-a-port", "bad host:12345"} {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		start := time.Now()
+		_, err := Dial(ctx, addr)
+		cancel()
+		if err == nil {
+			t.Errorf("Dial with invalid address %q succeeded", addr)
+			continue
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("Dial with invalid address %q waited for context deadline: %v", addr, err)
+		}
+		if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+			t.Errorf("Dial with invalid address %q took %v, want a prompt failure", addr, elapsed)
+		}
+	}
+}
+
 // ErrConnectionClosed keeps the first transport failure in the chain (%w,
 // 46f0cf1): a caller can still tell a read timeout from a dropped socket.
 func TestBrokenConnectionKeepsCause(t *testing.T) {

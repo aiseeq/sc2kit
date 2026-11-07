@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -34,12 +36,16 @@ type Client struct {
 // starting up and not yet listening.
 var dialRetryInterval = 500 * time.Millisecond
 
-// Dial connects to an SC2 client at addr (host:port), retrying until the
-// client accepts the connection or ctx is done. The game process needs a few
-// seconds after launch before it starts listening, so pass a ctx with a
-// deadline.
+// Dial connects to an SC2 client at addr (host:port), retrying network failures
+// and server refusals until the client accepts the connection or ctx is done.
+// Syntactically invalid host:port addresses return immediately. The game
+// process needs a few seconds after launch before it starts listening, so pass
+// a ctx with a deadline.
 func Dial(ctx context.Context, addr string) (*Client, error) {
 	url := "ws://" + addr + "/sc2api"
+	if err := validateDialAddress(addr); err != nil {
+		return nil, fmt.Errorf("sc2kit: dial %s: %w", url, err)
+	}
 	// WriteBufferSize должен вмещать самое большое сообщение целиком: при
 	// переполнении буфера gorilla фрагментирует сообщение на continuation-
 	// фреймы, а websocket-сервер SC2 фрагментацию не поддерживает и рвёт
@@ -67,6 +73,24 @@ func Dial(ctx context.Context, addr string) (*Client, error) {
 		case <-time.After(dialRetryInterval):
 		}
 	}
+}
+
+func validateDialAddress(addr string) error {
+	if _, err := url.ParseRequestURI("ws://" + addr + "/sc2api"); err != nil {
+		return fmt.Errorf("invalid host:port %q: %w", addr, err)
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("invalid host:port %q: %w", addr, err)
+	}
+	if host == "" {
+		return fmt.Errorf("invalid host:port %q: host is empty", addr)
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 {
+		return fmt.Errorf("invalid host:port %q: port must be between 1 and 65535", addr)
+	}
+	return nil
 }
 
 // Close closes the connection. The SC2 client keeps running.
