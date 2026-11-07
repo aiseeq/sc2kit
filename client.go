@@ -36,6 +36,8 @@ type Client struct {
 // starting up and not yet listening.
 var dialRetryInterval = 500 * time.Millisecond
 
+const maxRequestSize = 32 << 20
+
 // Dial connects to an SC2 client at addr (host:port), retrying network failures
 // and server refusals until the client accepts the connection or ctx is done.
 // Syntactically invalid host:port addresses return immediately. The game
@@ -46,17 +48,17 @@ func Dial(ctx context.Context, addr string) (*Client, error) {
 	if err := validateDialAddress(addr); err != nil {
 		return nil, fmt.Errorf("sc2kit: dial %s: %w", url, err)
 	}
-	// WriteBufferSize должен вмещать самое большое сообщение целиком: при
+	// WriteBufferSize должен вмещать любое разрешённое сообщение целиком: при
 	// переполнении буфера gorilla фрагментирует сообщение на continuation-
 	// фреймы, а websocket-сервер SC2 фрагментацию не поддерживает и рвёт
 	// соединение (close 1006; поймано 2026-08-29 на StartReplay с map_data
 	// ~5 МБ; тот же факт — go-sc2ai client/connection.go MaxMessageSize).
-	// 32 МБ покрывают replay_data+map_data самых больших реплеев.
+	// Запросы больше maxRequestSize отклоняются до записи.
 	// Ping-фреймы websocket не шлём (gorilla сам их не шлёт): сервер SC2
 	// не отвечает PONG, а разбирает ping как запрос и отдаёт пустой ответ
 	// (Tyr SC2API-CSharp/ProtobufProxy.cs, Sharky FastProtobufProxy.cs —
 	// оба ставят KeepAliveInterval в 30 дней).
-	dialer := websocket.Dialer{HandshakeTimeout: 5 * time.Second, WriteBufferSize: 32 << 20}
+	dialer := websocket.Dialer{HandshakeTimeout: 5 * time.Second, WriteBufferSize: maxRequestSize}
 	var lastErr error
 	for {
 		conn, resp, err := dialer.DialContext(ctx, url, nil)
@@ -105,7 +107,9 @@ func (c *Client) Status() api.Status {
 	return c.status
 }
 
-// Request sends one request and waits for its response. Unrecognized errors
+// Request sends one request and waits for its response. The marshaled request
+// must not exceed 32 MiB; larger requests are rejected before any bytes are
+// written so SC2 never receives a fragmented message. Unrecognized errors
 // accompanying a command result are warnings returned in Response.error.
 // Recognized protocol conditions and errors without a command result are
 // returned as ProtocolError.
@@ -113,6 +117,9 @@ func (c *Client) Request(ctx context.Context, req *api.Request) (*api.Response, 
 	data, err := proto.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("sc2kit: marshal request: %w", err)
+	}
+	if len(data) > maxRequestSize {
+		return nil, fmt.Errorf("sc2kit: request size %d exceeds maximum request size %d bytes", len(data), maxRequestSize)
 	}
 
 	release, err := c.acquireRequest(ctx)

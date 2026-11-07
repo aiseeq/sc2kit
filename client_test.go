@@ -538,7 +538,42 @@ func readFrame(r *bufio.Reader) (wsFrame, error) {
 // map_data): a large request must leave as one final frame. The fake here
 // speaks raw websocket to see the frames gorilla would hide.
 func TestLargeRequestOneFrame(t *testing.T) {
-	frames := make(chan wsFrame, 1)
+	frames := make(chan frameResult, 1)
+	addr := rawFrameSC2Server(t, frames)
+	c, ctx := dialSC2(t, addr)
+	req := &api.RequestStartReplay{
+		Replay:  &api.RequestStartReplay_ReplayData{ReplayData: make([]byte, 1<<20)},
+		MapData: make([]byte, 5<<20),
+	}
+	err := c.StartReplay(ctx, req)
+	var got frameResult
+	select {
+	case got = <-frames:
+	case <-ctx.Done():
+		t.Fatalf("server saw no frame; StartReplay: %v", err)
+	}
+	if got.err != nil {
+		t.Fatalf("read request frame: %v", got.err)
+	}
+	f := got.frame
+	if !f.fin || f.opcode != websocket.BinaryMessage {
+		t.Fatalf("first frame fin=%v opcode=%d size=%d: the request was fragmented", f.fin, f.opcode, f.size)
+	}
+	if want := proto.Size(&api.Request{Request: &api.Request_StartReplay{StartReplay: req}}); f.size != uint64(want) {
+		t.Errorf("frame size = %d, want the whole request %d", f.size, want)
+	}
+	if err != nil {
+		t.Errorf("StartReplay: %v", err)
+	}
+}
+
+type frameResult struct {
+	frame wsFrame
+	err   error
+}
+
+func rawFrameSC2Server(t *testing.T, frames chan<- frameResult) string {
+	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, rw, err := http.NewResponseController(w).Hijack()
 		if err != nil {
@@ -553,13 +588,9 @@ func TestLargeRequestOneFrame(t *testing.T) {
 			return
 		}
 		f, err := readFrame(rw.Reader)
-		if err != nil {
-			t.Errorf("read frame: %v", err)
+		frames <- frameResult{frame: f, err: err}
+		if err != nil || !f.fin {
 			return
-		}
-		frames <- f
-		if !f.fin {
-			return // like SC2: a fragment kills the connection
 		}
 		out, err := proto.Marshal(&api.Response{
 			Response: &api.Response_StartReplay{StartReplay: &api.ResponseStartReplay{}},
@@ -574,26 +605,27 @@ func TestLargeRequestOneFrame(t *testing.T) {
 		_, _ = readFrame(rw.Reader) // until the client closes
 	}))
 	t.Cleanup(srv.Close)
+	return strings.TrimPrefix(srv.URL, "http://")
+}
 
-	c, ctx := dialSC2(t, strings.TrimPrefix(srv.URL, "http://"))
+func TestOversizedRequest(t *testing.T) {
+	frames := make(chan frameResult, 1)
+	c, ctx := dialSC2(t, rawFrameSC2Server(t, frames))
 	req := &api.RequestStartReplay{
-		Replay:  &api.RequestStartReplay_ReplayData{ReplayData: make([]byte, 1<<20)},
-		MapData: make([]byte, 5<<20),
+		Replay: &api.RequestStartReplay_ReplayData{ReplayData: make([]byte, (32<<20)+1)},
 	}
 	err := c.StartReplay(ctx, req)
-	var f wsFrame
+	if err == nil || !strings.Contains(err.Error(), "maximum request size") {
+		t.Fatalf("oversized StartReplay error = %v, want explicit maximum-size error", err)
+	}
+	_ = c.Close()
+	var got frameResult
 	select {
-	case f = <-frames:
+	case got = <-frames:
 	case <-ctx.Done():
-		t.Fatalf("server saw no frame; StartReplay: %v", err)
+		t.Fatalf("server did not observe connection close after rejected request: %v", ctx.Err())
 	}
-	if !f.fin || f.opcode != websocket.BinaryMessage {
-		t.Fatalf("first frame fin=%v opcode=%d size=%d: the request was fragmented", f.fin, f.opcode, f.size)
-	}
-	if want := proto.Size(&api.Request{Request: &api.Request_StartReplay{StartReplay: req}}); f.size != uint64(want) {
-		t.Errorf("frame size = %d, want the whole request %d", f.size, want)
-	}
-	if err != nil {
-		t.Errorf("StartReplay: %v", err)
+	if got.err == nil {
+		t.Fatalf("server received a frame for rejected request: %+v", got.frame)
 	}
 }
